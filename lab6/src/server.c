@@ -1,5 +1,6 @@
 #include <limits.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,6 +13,7 @@
 #include <sys/types.h>
 
 #include "pthread.h"
+#include "multModul.h"
 
 struct FactorialArgs {
   uint64_t begin;
@@ -19,30 +21,39 @@ struct FactorialArgs {
   uint64_t mod;
 };
 
-uint64_t MultModulo(uint64_t a, uint64_t b, uint64_t mod) {
-  uint64_t result = 0;
-  a = a % mod;
-  while (b > 0) {
-    if (b % 2 == 1)
-      result = (result + a) % mod;
-    a = (a * 2) % mod;
-    b /= 2;
-  }
-
-  return result % mod;
-}
-
+// Произведение чисел begin..end включительно по модулю mod.
+// Для пустого диапазона (begin > end) возвращает 1 % mod.
 uint64_t Factorial(const struct FactorialArgs *args) {
-  uint64_t ans = 1;
+  uint64_t ans = 1 % args->mod;
 
-  // TODO: your code here
+  for (uint64_t i = args->begin; i <= args->end; i++) {
+    ans = MultModulo(ans, i, args->mod);
+    if (i == UINT64_MAX) // защита от переполнения счётчика
+      break;
+  }
 
   return ans;
 }
 
 void *ThreadFactorial(void *args) {
   struct FactorialArgs *fargs = (struct FactorialArgs *)args;
-  return (void *)(uint64_t *)Factorial(fargs);
+  return (void *)(uintptr_t)Factorial(fargs);
+}
+
+// Читает ровно len байт (TCP может отдать данные частями).
+static bool RecvAll(int fd, char *buf, size_t len) {
+  size_t got = 0;
+  while (got < len) {
+    ssize_t r = recv(fd, buf + got, len - got, 0);
+    if (r == 0)
+      return got == 0 ? false : (fprintf(stderr, "Client closed early\n"), false);
+    if (r < 0) {
+      fprintf(stderr, "Client read failed\n");
+      return false;
+    }
+    got += (size_t)r;
+  }
+  return true;
 }
 
 int main(int argc, char **argv) {
@@ -50,8 +61,6 @@ int main(int argc, char **argv) {
   int port = -1;
 
   while (true) {
-    int current_optind = optind ? optind : 1;
-
     static struct option options[] = {{"port", required_argument, 0, 0},
                                       {"tnum", required_argument, 0, 0},
                                       {0, 0, 0, 0}};
@@ -67,11 +76,17 @@ int main(int argc, char **argv) {
       switch (option_index) {
       case 0:
         port = atoi(optarg);
-        // TODO: your code here
+        if (port <= 0 || port > 65535) {
+          fprintf(stderr, "Invalid port: %s\n", optarg);
+          return 1;
+        }
         break;
       case 1:
         tnum = atoi(optarg);
-        // TODO: your code here
+        if (tnum <= 0) {
+          fprintf(stderr, "tnum must be positive\n");
+          return 1;
+        }
         break;
       default:
         printf("Index %d is out of options\n", option_index);
@@ -130,22 +145,11 @@ int main(int argc, char **argv) {
     }
 
     while (true) {
-      unsigned int buffer_size = sizeof(uint64_t) * 3;
-      char from_client[buffer_size];
-      int read = recv(client_fd, from_client, buffer_size, 0);
+      const size_t buffer_size = sizeof(uint64_t) * 3;
+      char from_client[sizeof(uint64_t) * 3];
 
-      if (!read)
+      if (!RecvAll(client_fd, from_client, buffer_size))
         break;
-      if (read < 0) {
-        fprintf(stderr, "Client read failed\n");
-        break;
-      }
-      if (read < buffer_size) {
-        fprintf(stderr, "Client send wrong data format\n");
-        break;
-      }
-
-      pthread_t threads[tnum];
 
       uint64_t begin = 0;
       uint64_t end = 0;
@@ -154,35 +158,63 @@ int main(int argc, char **argv) {
       memcpy(&end, from_client + sizeof(uint64_t), sizeof(uint64_t));
       memcpy(&mod, from_client + 2 * sizeof(uint64_t), sizeof(uint64_t));
 
-      fprintf(stdout, "Receive: %llu %llu %llu\n", begin, end, mod);
+      fprintf(stdout, "Receive: %llu %llu %llu\n", (unsigned long long)begin,
+              (unsigned long long)end, (unsigned long long)mod);
 
+      if (mod == 0) {
+        fprintf(stderr, "Client sent mod = 0\n");
+        break;
+      }
+
+      pthread_t threads[tnum];
       struct FactorialArgs args[tnum];
-      for (uint32_t i = 0; i < tnum; i++) {
-        // TODO: parallel somehow
-        args[i].begin = 1;
-        args[i].end = 1;
+
+      // Делим [begin, end] на tnum примерно равных частей.
+      // Если begin > end, диапазон пуст: все потоки вернут 1.
+      uint64_t len = (begin <= end) ? (end - begin + 1) : 0;
+      uint64_t part = len / (uint64_t)tnum;
+      uint64_t rest = len % (uint64_t)tnum;
+      uint64_t cur = begin;
+      bool failed = false;
+      int created = 0;
+
+      for (int i = 0; i < tnum; i++) {
+        uint64_t size = part + ((uint64_t)i < rest ? 1 : 0);
         args[i].mod = mod;
+        if (size == 0) {
+          args[i].begin = 1; // пустой диапазон
+          args[i].end = 0;
+        } else {
+          args[i].begin = cur;
+          args[i].end = cur + size - 1;
+          cur += size;
+        }
 
         if (pthread_create(&threads[i], NULL, ThreadFactorial,
                            (void *)&args[i])) {
-          printf("Error: pthread_create failed!\n");
-          return 1;
+          fprintf(stderr, "Error: pthread_create failed!\n");
+          failed = true;
+          break;
         }
+        created++;
       }
 
-      uint64_t total = 1;
-      for (uint32_t i = 0; i < tnum; i++) {
-        uint64_t result = 0;
-        pthread_join(threads[i], (void **)&result);
-        total = MultModulo(total, result, mod);
+      uint64_t total = 1 % mod;
+      for (int i = 0; i < created; i++) {
+        void *ret = NULL;
+        pthread_join(threads[i], &ret);
+        total = MultModulo(total, (uint64_t)(uintptr_t)ret, mod);
       }
 
-      printf("Total: %llu\n", total);
+      if (failed)
+        break;
+
+      printf("Total: %llu\n", (unsigned long long)total);
 
       char buffer[sizeof(total)];
       memcpy(buffer, &total, sizeof(total));
-      err = send(client_fd, buffer, sizeof(total), 0);
-      if (err < 0) {
+      ssize_t sent = send(client_fd, buffer, sizeof(total), 0);
+      if (sent < 0) {
         fprintf(stderr, "Can't send data to client\n");
         break;
       }
