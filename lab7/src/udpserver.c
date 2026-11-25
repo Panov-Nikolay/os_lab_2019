@@ -8,14 +8,14 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#define SERV_PORT 20001
-#define BUFSIZE 1024
+// #define SERV_PORT 20001
+// #define BUFSIZE 1024
 #define SADDR struct sockaddr
 #define SLEN sizeof(struct sockaddr_in)
 
-int main() {
+int main(int argc, char *argv[]) {
   int sockfd, n;
-  char mesg[BUFSIZE], ipadr[16];
+  char ipadr[16];
   struct sockaddr_in servaddr;
   struct sockaddr_in cliaddr;
 
@@ -23,6 +23,23 @@ int main() {
     perror("socket problem");
     exit(1);
   }
+
+  if (argc < 3) {
+    printf("usage: server <Port> <Bufsize>\n");
+    exit(1);
+  }
+  int SERV_PORT = atoi(argv[1]);
+  if (SERV_PORT <= 0 || SERV_PORT >= 65336){
+    perror("invalid port");
+    exit(1);
+  }
+
+  int BUFSIZE = atoi(argv[2]);
+  if (BUFSIZE <= 0){
+    perror("invalid bufsize");
+    exit(1);
+  }
+  char mesg[BUFSIZE];
 
   memset(&servaddr, 0, SLEN);
   servaddr.sin_family = AF_INET;
